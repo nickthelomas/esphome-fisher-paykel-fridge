@@ -1,0 +1,262 @@
+# Fisher & Paykel RF505BRNUX1 (Haier-platform main board 0061801364) -> Home Assistant, listen only.
+# Seeed XIAO ESP32-C3. No transmit pins are configured: nothing is ever sent to the fridge.
+#   D10 (GPIO10) <- CN11 D-TX  (main board -> inside control panel, 9600 8N1, INVERTED, 5 V logic) via 100k / 220k divider
+#   D5  (GPIO7)  <- BUS        (main board <-> ice & water board and door display, 9600 8N1, idles at 12 V) via 100k / 33k divider
+#   D1  (GPIO3)  <- R-S fridge thermistor   via 1M / 1M divider + 100 nF to GND (high impedance, so the fridge's reading doesn't shift)
+#   D2  (GPIO4)  <- F-S freezer thermistor  via 1M / 1M divider + 100 nF to GND
+#   D3  (GPIO5)  <- optional DS18B20 reference probe (module with its own 4.7k pull-up), 3V3 / GND / D3
+#   GND          <- fridge GND (CN11 pin 5)
+# Power: an ISOLATED 5 V supply (a USB phone charger is simplest). Never the fridge's own 5 V.
+# Byte map and wiring: README.md and docs/.
+substitutions:
+  name: fridge-sniffer
+  friendly_name: "Fridge Sniffer"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: esp32c3
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: DEBUG
+  logs:
+    api: INFO
+    api.service: INFO
+    wifi: INFO
+    component: INFO
+    adc: INFO
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: "Fridge Sniffer AP"
+    password: !secret ap_password
+
+captive_portal:
+
+one_wire:
+  - platform: gpio
+    pin: GPIO5
+
+uart:
+  - id: door_uart
+    rx_pin:
+      number: GPIO10
+      inverted: true
+    baud_rate: 9600
+    rx_buffer_size: 1024
+  - id: bus_uart
+    rx_pin: GPIO7
+    baud_rate: 9600
+    rx_buffer_size: 1024
+
+# Cut both streams into A5 [dst] [len] [src] [cmd] ... 5A frames (len = whole frame) and log a
+# frame only when it differs from the last frame of the same type. Every 10 min, log them all.
+# The 23/28/34-byte frames carry CRC-16/MODBUS over bytes 1..n-4, low byte first at n-3; frames
+# that fail it are dropped (≈0.1% of BUS frames have 1->0 bit flips). Shorter frames use another
+# check we haven't cracked, so nothing published to HA comes from them.
+interval:
+  - interval: 10ms
+    then:
+      - lambda: |-
+          struct Chan {
+            esphome::uart::UARTComponent *u;
+            const char *name;
+            std::vector<uint8_t> buf;
+            std::map<uint32_t, std::vector<uint8_t>> last;
+            uint32_t frames, bad, bytes, crc_fail;
+            std::vector<uint8_t> sample;   // first raw bytes of each minute, for diagnosing a dead link
+          };
+          static Chan ch[2] = {{id(door_uart), "DOOR", {}, {}, 0, 0, 0, 0, {}}, {id(bus_uart), "BUS", {}, {}, 0, 0, 0, 0, {}}};
+          static uint32_t last_stats = 0, last_dump = 0;
+          auto crc_ok = [](const std::vector<uint8_t> &f) {
+            size_t n = f.size();
+            uint16_t crc = 0xFFFF;
+            for (size_t k = 1; k + 3 < n; k++) {
+              crc ^= f[k];
+              for (int j = 0; j < 8; j++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+            }
+            return crc == (uint16_t) (f[n - 3] | (f[n - 2] << 8));
+          };
+          auto known_node = [](uint8_t a) { return a == 0xFF || a == 0x04 || a == 0x08 || a == 0xFC; };
+          uint32_t now = millis();
+          bool dump = now - last_dump > 600000;
+          for (auto &c : ch) {
+            uint8_t b;
+            while (c.u->available() && c.u->read_byte(&b)) {
+              c.buf.push_back(b);
+              c.bytes++;
+              if (c.sample.size() < 48) c.sample.push_back(b);
+            }
+            size_t i = 0;
+            while (true) {
+              while (i < c.buf.size() && c.buf[i] != 0xA5) i++;
+              if (i + 3 > c.buf.size()) break;
+              uint8_t n = c.buf[i + 2];
+              if (n < 6 || n > 64) { i++; continue; }
+              if (i + n > c.buf.size()) break;
+              if (c.buf[i + n - 1] != 0x5A) { c.bad++; i++; continue; }
+              std::vector<uint8_t> fr(c.buf.begin() + i, c.buf.begin() + i + n);
+              bool checked = (n == 23 || n == 28 || n == 34);
+              if (checked ? !crc_ok(fr) : !(known_node(fr[1]) && known_node(fr[3]))) {
+                c.crc_fail++;
+                i += n;
+                continue;
+              }
+              c.frames++;
+              // CN11 main -> panel status (28 bytes): settings, modes, doors
+              if (&c == &ch[0] && n == 28 && fr[1] == 0xFC && fr[4] == 0x03) {
+                id(fridge_door).publish_state((fr[18] & 0x04) != 0);
+                id(freezer_door).publish_state((fr[18] & 0x08) != 0);
+                if (id(fridge_setpoint).state != fr[6]) id(fridge_setpoint).publish_state(fr[6]);
+                if (id(freezer_setpoint).state != (int) fr[7] - 24) id(freezer_setpoint).publish_state((int) fr[7] - 24);
+                id(fast_freeze).publish_state((fr[9] & 0x01) != 0);
+                id(alarm_muted).publish_state((fr[9] & 0x08) != 0);
+                id(ice_maker).publish_state((fr[10] & 0x01) != 0);
+                id(ice_boost).publish_state((fr[10] & 0x02) != 0);
+                id(bottle_chill).publish_state((fr[10] & 0x08) != 0);
+                id(filter_due).publish_state((fr[10] & 0x20) != 0);
+              }
+              // BUS main -> node 04 (23 bytes): byte 7 = 0x20 dispenser locked, 0x10 compressor, 0x08 fan;
+              // byte 19 = defrost stage (0 = none); bytes 13-14 = freezer sensor, 0.1 °C steps from -40 °C
+              if (&c == &ch[1] && n == 23 && fr[1] == 0x04 && fr[3] == 0xFF && fr[4] == 0x03) {
+                id(compressor).publish_state((fr[7] & 0x10) != 0);
+                id(fan).publish_state((fr[7] & 0x08) != 0);
+                id(dispenser_lock).publish_state((fr[7] & 0x20) == 0);   // lock class: on = unlocked
+                id(defrost).publish_state(fr[19] != 0);
+                if (id(defrost_stage).state != fr[19]) id(defrost_stage).publish_state(fr[19]);
+                id(freezer_temp).publish_state(((fr[13] << 8) | fr[14]) / 10.0f - 40.0f);
+              }
+              // BUS node 04 -> main (34 bytes): bytes 6-7 = evaporator (defrost) sensor, same scale; byte 27 bit 0x08 = water valve
+              if (&c == &ch[1] && n == 34 && fr[1] == 0xFF && fr[3] == 0x04 && fr[4] == 0x03) {
+                id(coil_temp).publish_state(((fr[6] << 8) | fr[7]) / 10.0f - 40.0f);
+                id(water_valve).publish_state((fr[27] & 0x08) != 0);
+              }
+              uint32_t key = (uint32_t(n) << 24) | (uint32_t(fr[1]) << 16) | (uint32_t(fr[3]) << 8) | fr[4];
+              auto it = c.last.find(key);
+              if (it == c.last.end() || it->second != fr) {
+                ESP_LOGI("frame", "%s %s", c.name, format_hex_pretty(fr).c_str());
+                c.last[key] = fr;
+              }
+              i += n;
+            }
+            c.buf.erase(c.buf.begin(), c.buf.begin() + i);
+            if (c.buf.size() > 512) c.buf.clear();
+            if (dump)
+              for (auto &kv : c.last) ESP_LOGI("snap", "%s %s", c.name, format_hex_pretty(kv.second).c_str());
+          }
+          if (dump) last_dump = now;
+          if (now - last_stats > 60000) {
+            last_stats = now;
+            ESP_LOGI("stats", "DOOR frames %u bad %u crc %u bytes %u | BUS frames %u bad %u crc %u bytes %u",
+                     (unsigned) ch[0].frames, (unsigned) ch[0].bad, (unsigned) ch[0].crc_fail, (unsigned) ch[0].bytes,
+                     (unsigned) ch[1].frames, (unsigned) ch[1].bad, (unsigned) ch[1].crc_fail, (unsigned) ch[1].bytes);
+            for (auto &c : ch) {
+              ESP_LOGI("raw", "%s %s", c.name, format_hex_pretty(c.sample).c_str());
+              c.sample.clear();
+            }
+          }
+
+binary_sensor:
+  - platform: template
+    id: fridge_door
+    name: "Fridge door"
+    device_class: door
+  - platform: template
+    id: freezer_door
+    name: "Freezer drawer"
+    device_class: door
+  - {platform: template, id: fast_freeze, name: "Fast Freeze", icon: "mdi:snowflake-alert"}
+  - {platform: template, id: bottle_chill, name: "Bottle Chill", icon: "mdi:bottle-wine"}
+  - {platform: template, id: alarm_muted, name: "Door alarm muted", icon: "mdi:bell-off"}
+  - {platform: template, id: ice_maker, name: "Ice maker", icon: "mdi:cube-outline"}
+  - {platform: template, id: ice_boost, name: "Ice Boost", icon: "mdi:cube-send"}
+  - {platform: template, id: filter_due, name: "Water filter change due", device_class: problem}
+  - {platform: template, id: dispenser_lock, name: "Water dispenser", device_class: lock}
+  - {platform: template, id: compressor, name: "Compressor", device_class: running}
+  - {platform: template, id: fan, name: "Fan", device_class: running}
+  - {platform: template, id: defrost, name: "Defrost", device_class: running}
+  - {platform: template, id: water_valve, name: "Water valve", device_class: running}
+
+sensor:
+  - platform: template
+    id: fridge_setpoint
+    name: "Fridge setting"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: freezer_setpoint
+    name: "Freezer setting"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: defrost_stage
+    name: "Defrost stage"
+    accuracy_decimals: 0
+    update_interval: never
+  # the main board's own readings, sent on the BUS as (°C + 40) x 10
+  - platform: template
+    id: freezer_temp
+    name: "Freezer temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: 30s
+  - platform: template
+    id: coil_temp
+    name: "Evaporator temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle_average: 30s
+  - platform: adc
+    pin: GPIO3
+    name: "R-S fridge sensor voltage"
+    id: rs_volts
+    attenuation: 12db
+    samples: 16
+    update_interval: 10s
+    accuracy_decimals: 3
+    filters:
+      - multiply: 2.0
+  - platform: adc
+    pin: GPIO4
+    name: "F-S freezer sensor voltage"
+    id: fs_volts
+    attenuation: 12db
+    samples: 16
+    update_interval: 10s
+    accuracy_decimals: 3
+    filters:
+      - multiply: 2.0
+  # optional reference probe for calibrating the R-S voltage (delete this and one_wire: if you don't fit one)
+  - {platform: dallas_temp, index: 0, name: "Reference probe", update_interval: 10s, accuracy_decimals: 2}
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 60s
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
