@@ -9,8 +9,8 @@
 # Power: an ISOLATED 5 V supply (a USB phone charger is simplest). Never the fridge's own 5 V.
 # Byte map and wiring: README.md and docs/.
 substitutions:
-  name: fridge-sniffer
-  friendly_name: "Fridge Sniffer"
+  name: fridge-bridge
+  friendly_name: "Fridge Bridge"
 
 esphome:
   name: ${name}
@@ -42,7 +42,7 @@ wifi:
   password: !secret wifi_password
   power_save_mode: none
   ap:
-    ssid: "Fridge Sniffer AP"
+    ssid: "Fridge Bridge AP"
     password: !secret ap_password
 
 captive_portal:
@@ -209,6 +209,7 @@ sensor:
   - platform: template
     id: defrost_stage
     name: "Defrost stage"
+    entity_category: diagnostic
     accuracy_decimals: 0
     update_interval: never
   # the main board's own readings, sent on the BUS as (°C + 40) x 10
@@ -251,6 +252,7 @@ sensor:
   - platform: adc
     pin: GPIO3
     name: "R-S fridge sensor voltage"
+    entity_category: diagnostic
     id: rs_volts
     attenuation: 12db
     samples: 16
@@ -261,6 +263,7 @@ sensor:
   - platform: adc
     pin: GPIO4
     name: "F-S freezer sensor voltage"
+    entity_category: diagnostic
     id: fs_volts
     attenuation: 12db
     samples: 16

@@ -146,7 +146,7 @@ Power: 5 V from an isolated supply into the XIAO (USB-C, or its 5V pin)
 
 ## Firmware
 
-[`fridge-sniffer.yaml`](fridge-sniffer.yaml) (ESPHome 2026.10). Put `wifi_ssid`, `wifi_password` and
+[`fridge-bridge.yaml`](fridge-bridge.yaml) (ESPHome 2026.10). Put `wifi_ssid`, `wifi_password` and
 `ap_password` in your `secrets.yaml`. The UARTs have only `rx_pin`s, so the ESP32 cannot send anything to the fridge.
 
 ## Licence
