@@ -232,6 +232,22 @@ sensor:
     update_interval: never
     filters:
       - throttle_average: 30s
+  # R-S thermistor -> °C: NTC divider, Vs 5.236 V, B 3591 (fitted on F-S against the BUS freezer reading),
+  # k 2.275 fitted against a thermometer in the middle of the fridge. Check k on your own fridge.
+  - platform: template
+    id: fridge_temp
+    name: "Fridge temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      float v = id(rs_volts).state;
+      if (isnan(v) || v < 0.5f || v > 5.0f) return NAN;
+      return 1.0f / (1.0f / 298.15f - logf((5.236f / v - 1.0f) / 2.275f) / 3591.0f) - 273.15f;
+    filters:
+      - sliding_window_moving_average: {window_size: 3, send_every: 3}
   - platform: adc
     pin: GPIO3
     name: "R-S fridge sensor voltage"

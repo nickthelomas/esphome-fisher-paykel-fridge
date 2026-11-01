@@ -13,7 +13,7 @@ What Home Assistant gets:
 | Compressor, fan, defrost, defrost stage | BUS |
 | Water dispenser locked, water valve | BUS |
 | Freezer temperature, evaporator temperature (°C, the fridge's own sensors) | BUS |
-| R-S fridge sensor and F-S freezer sensor voltages | thermistor taps |
+| Fridge temperature (°C), plus the R-S and F-S sensor voltages | thermistor taps |
 
 The main board is a Haier platform board (F&P is Haier-owned), so other F&P and Haier fridges built on the same
 board may speak the same protocol. Check yours with a logic analyser before trusting the byte map.
@@ -112,7 +112,15 @@ The main board sends its sensor readings as **(°C + 40) × 10**, so `°C = valu
 | Evaporator, end of defrost | 475 | +7.5 |
 
 The fridge compartment sensor (`R-S`) is not on either link, so it is read from the thermistor through a
-1M/1M divider (see below).
+1M/1M divider (see below) and converted with the usual NTC divider formula:
+
+```text
+°C = 1 / (1/298.15 − ln((5.236/V − 1) / k) / 3591) − 273.15        k = 2.275 on mine
+```
+
+`5.236` and `3591` come from fitting the F-S voltage against the main board's own freezer reading (correlation
+0.998, 12 mV rms). `k` was fitted against a thermometer in the middle of the fridge overnight (0.2 °C rms on
+30-minute averages). On mine, 2.80 V = 3.0 °C and 2.70 V = 4.6 °C. Check `k` on your own fridge.
 
 ## Wiring
 
